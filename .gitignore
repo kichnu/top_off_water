@@ -1,0 +1,71 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Virtual environments
+venv/
+.env/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Jupyter Notebook checkpoint files
+.ipynb_checkpoints/
+
+# Pytest and coverage
+.cache/
+.pytest_cache/
+coverage.*
+htmlcov/
+
+# MyPy and static analysis
+.mypy_cache/
+.dmypy.json
+.pyre/
+
+# VSCode settings
+.vscode/
+
+# PyCharm settings
+.idea/
+
+# Logs and temp files
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+*.DS_Store
+
+# Secret or config files (optional)
+.env.local
+.env.*.local
+*.secret
+secrets.json
+
+# Ignore database or data files (optional)
+*.sqlite3
+*.db
+*.csv
+*.tsv
+*.json
+
+# Ignore compiled Cython files
+*.c
+*.cpp
+*.pyd
