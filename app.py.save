@@ -1,0 +1,606 @@
+#!/usr/bin/env python3
+"""
+ESP32-C3 Water System VPS Logger
+Odbiera i przechowuje zdarzenia z systemu podlewania
++ Admin Panel do zapytań SQL
+"""
+
+from flask import Flask, request, jsonify, render_template, send_file, Response
+import sqlite3
+import json
+import logging
+from datetime import datetime
+import os
+import csv
+import io
+import re
+from functools import wraps
+import base64
+
+# Konfiguracja
+DATABASE_PATH = '/home/kichnu/top_off_water/water_events.db'
+LOG_PATH = '/home/kichnu/top_off_water/app.log'
+VALID_TOKEN = 'WaterSystem2024_StaticToken_ESP32C3'
+VALID_DEVICE_IDS = ['ESP32C3_WaterPump_001']
+
+# Konfiguracja Admin Panel
+ADMIN_USERNAME = 'admin'
+ADMIN_PASSWORD = 'admin
+ADMIN_ALLOWED_IPS = [
+    '127.0.0.1',
+    '192.168.0.124/24', 
+    '192.168.0.0/24',
+]
+
+app = Flask(__name__)
+
+# Konfiguracja logowania
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_PATH),
+        logging.StreamHandler()
+    ]
+)
+
+def init_database():
+    """Inicjalizacja bazy danych SQLite"""
+    os.makedirs(os.path.dirname(DATABASE_PATH), exist_ok=True)
+    
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS water_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            unix_time INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            volume_ml INTEGER NOT NULL,
+            water_status TEXT NOT NULL,
+            system_status TEXT NOT NULL,
+            received_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            client_ip TEXT
+        )
+    ''')
+    
+    # Indeksy dla lepszej wydajności
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_device_id ON water_events(device_id)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON water_events(unix_time)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_event_type ON water_events(event_type)')
+    
+    conn.commit()
+    conn.close()
+    
+    logging.info("Database initialized successfully")
+
+def check_ip_allowed(ip, allowed_networks):
+    """Sprawdź czy IP jest w dozwolonych sieciach"""
+    import ipaddress
+    
+    try:
+        ip_obj = ipaddress.ip_address(ip)
+        for network in allowed_networks:
+            if '/' in network:
+                if ip_obj in ipaddress.ip_network(network, strict=False):
+                    return True
+            else:
+                if str(ip_obj) == network:
+                    return True
+    except:
+        pass
+    return False
+
+def require_auth(f):
+    """Dekorator do sprawdzania autoryzacji ESP32"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        auth_header = request.headers.get('Authorization')
+        
+        if not auth_header:
+            logging.warning(f"Missing Authorization header from {request.remote_addr}")
+            return jsonify({'error': 'Missing Authorization header'}), 401
+        
+        if not auth_header.startswith('Bearer '):
+            logging.warning(f"Invalid Authorization format from {request.remote_addr}")
+            return jsonify({'error': 'Invalid Authorization format'}), 401
+        
+        token = auth_header[7:]  # Remove 'Bearer '
+        
+        if token != VALID_TOKEN:
+            logging.warning(f"Invalid token from {request.remote_addr}: {token}")
+            return jsonify({'error': 'Invalid token'}), 401
+        
+        return f(*args, **kwargs)
+    
+    return decorated_function
+
+def require_admin_auth(f):
+    """Dekorator do sprawdzania autoryzacji Admin Panel"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        # Sprawdź IP
+        client_ip = request.remote_addr
+        if not check_ip_allowed(client_ip, ADMIN_ALLOWED_IPS):
+            logging.warning(f"Admin access denied for IP: {client_ip}")
+            return jsonify({'error': 'Access denied'}), 403
+        
+        # Sprawdź Basic Auth
+        auth = request.authorization
+        if not auth or auth.username != ADMIN_USERNAME or auth.password != ADMIN_PASSWORD:
+            logging.warning(f"Admin authentication failed from {client_ip}")
+            return Response(
+                'Admin authentication required\n'
+                'Login with admin credentials', 401,
+                {'WWW-Authenticate': 'Basic realm="Water System Admin"'})
+        
+        return f(*args, **kwargs)
+    
+    return decorated_function
+
+def validate_sql_query(query):
+    """Walidacja zapytania SQL - tylko SELECT"""
+    query = query.strip().upper()
+    
+    # Usuń komentarze
+    query = re.sub(r'--.*$', '', query, flags=re.MULTILINE)
+    query = re.sub(r'/\*.*?\*/', '', query, flags=re.DOTALL)
+    
+    # Dozwolone słowa kluczowe
+    allowed_keywords = ['SELECT', 'FROM', 'WHERE', 'ORDER', 'BY', 'LIMIT', 'GROUP', 'HAVING', 'AS', 'ASC', 'DESC', 'COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'DISTINCT', 'AND', 'OR', 'NOT', 'IN', 'LIKE', 'BETWEEN', 'IS', 'NULL', 'DATETIME', 'DATE', 'TIME', 'NOW', 'SUBSTR', 'LENGTH', 'ROUND']
+    
+    # Zablokowane słowa kluczowe
+    blocked_keywords = ['INSERT', 'UPDATE', 'DELETE', 'DROP', 'CREATE', 'ALTER', 'TRUNCATE', 'REPLACE', 'MERGE', 'EXEC', 'EXECUTE', 'CALL', 'UNION', 'ATTACH', 'DETACH', 'PRAGMA']
+    
+    # Sprawdź zablokowane słowa
+    for keyword in blocked_keywords:
+        if keyword in query:
+            return False, f"Forbidden keyword: {keyword}"
+    
+    # Musi zaczynać się od SELECT
+    if not query.startswith('SELECT'):
+        return False, "Only SELECT queries are allowed"
+    
+    # Sprawdź czy zapytanie ma dozwolone tabele
+    if 'WATER_EVENTS' not in query:
+        return False, "Only water_events table is allowed"
+    
+    return True, "Valid"
+
+def execute_safe_query(query, params=None):
+    """Bezpiecznie wykonaj zapytanie SQL"""
+    try:
+        conn = sqlite3.connect(DATABASE_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        # Ustaw timeout
+        conn.execute('PRAGMA query_timeout = 10000')  # 10 sekund
+        
+        if params:
+            cursor.execute(query, params)
+        else:
+            cursor.execute(query)
+        
+        results = cursor.fetchall()
+        
+        # Limit wyników
+        if len(results) > 1000:
+            results = results[:1000]
+        
+        conn.close()
+        return True, [dict(row) for row in results]
+        
+    except Exception as e:
+        return False, str(e)
+
+def validate_event_data(data):
+    """Walidacja danych zdarzenia"""
+    required_fields = [
+        'device_id', 'timestamp', 'unix_time', 
+        'event_type', 'volume_ml', 'water_status', 'system_status'
+    ]
+    
+    # Sprawdź czy wszystkie wymagane pola są obecne
+    for field in required_fields:
+        if field not in data:
+            return False, f"Missing required field: {field}"
+    
+    # Sprawdź typy danych
+    try:
+        unix_time = int(data['unix_time'])
+        volume_ml = int(data['volume_ml'])
+    except (ValueError, TypeError):
+        return False, "unix_time and volume_ml must be integers"
+    
+    # Sprawdź czy device_id jest dozwolony
+    if data['device_id'] not in VALID_DEVICE_IDS:
+        return False, f"Invalid device_id: {data['device_id']}"
+    
+    # Sprawdź dozwolone typy zdarzeń
+    valid_event_types = ['AUTO_PUMP', 'MANUAL_NORMAL', 'MANUAL_EXTENDED']
+    if data['event_type'] not in valid_event_types:
+        return False, f"Invalid event_type: {data['event_type']}"
+    
+    # Sprawdź dozwolone statusy wody
+    valid_water_statuses = ['OK', 'LOW', 'PARTIAL', 'CHECKING']
+    if data['water_status'] not in valid_water_statuses:
+        return False, f"Invalid water_status: {data['water_status']}"
+    
+    return True, "Valid"
+
+# ===============================
+# ESP32 API ENDPOINTS (bez zmian)
+# ===============================
+
+@app.route('/api/water-events', methods=['POST'])
+@require_auth
+def receive_water_event():
+    """Endpoint do odbierania zdarzeń z ESP32-C3"""
+    
+    client_ip = request.remote_addr
+    
+    try:
+        # Sprawdź Content-Type
+        if request.content_type != 'application/json':
+            logging.warning(f"Invalid Content-Type from {client_ip}: {request.content_type}")
+            return jsonify({'error': 'Content-Type must be application/json'}), 400
+        
+        # Pobierz dane JSON
+        data = request.get_json()
+        
+        if not data:
+            logging.warning(f"No JSON data received from {client_ip}")
+            return jsonify({'error': 'No JSON data provided'}), 400
+        
+        # Walidacja danych
+        is_valid, error_msg = validate_event_data(data)
+        if not is_valid:
+            logging.warning(f"Invalid data from {client_ip}: {error_msg}")
+            return jsonify({'error': error_msg}), 400
+        
+        # Zapisz do bazy danych
+        conn = sqlite3.connect(DATABASE_PATH)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO water_events 
+            (device_id, timestamp, unix_time, event_type, volume_ml, 
+             water_status, system_status, client_ip)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            data['device_id'],
+            data['timestamp'],
+            data['unix_time'],
+            data['event_type'],
+            data['volume_ml'],
+            data['water_status'],
+            data['system_status'],
+            client_ip
+        ))
+        
+        event_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        
+        # Loguj pomyślne zdarzenie
+        logging.info(
+            f"Event saved [ID: {event_id}] - Device: {data['device_id']}, "
+            f"Type: {data['event_type']}, Volume: {data['volume_ml']}ml, "
+            f"Status: {data['water_status']}, IP: {client_ip}"
+        )
+        
+        return jsonify({
+            'success': True,
+            'event_id': event_id,
+            'message': 'Event recorded successfully'
+        }), 200
+        
+    except json.JSONDecodeError:
+        logging.error(f"JSON decode error from {client_ip}")
+        return jsonify({'error': 'Invalid JSON format'}), 400
+    
+    except sqlite3.Error as e:
+        logging.error(f"Database error: {e}")
+        return jsonify({'error': 'Database error'}), 500
+    
+    except Exception as e:
+        logging.error(f"Unexpected error: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+@app.route('/api/events', methods=['GET'])
+@require_auth
+def get_events():
+    """Endpoint do pobierania historii zdarzeń"""
+    
+    try:
+        # Parametry zapytania
+        limit = request.args.get('limit', 100, type=int)
+        device_id = request.args.get('device_id')
+        event_type = request.args.get('event_type')
+        
+        # Ograniczenia
+        limit = min(limit, 1000)  # Max 1000 rekordów
+        
+        conn = sqlite3.connect(DATABASE_PATH)
+        conn.row_factory = sqlite3.Row  # Zwraca słowniki zamiast tupli
+        cursor = conn.cursor()
+        
+        # Buduj zapytanie SQL
+        query = "SELECT * FROM water_events WHERE 1=1"
+        params = []
+        
+        if device_id:
+            query += " AND device_id = ?"
+            params.append(device_id)
+        
+        if event_type:
+            query += " AND event_type = ?"
+            params.append(event_type)
+        
+        query += " ORDER BY received_at DESC LIMIT ?"
+        params.append(limit)
+        
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+        
+        # Konwertuj na listę słowników
+        events = [dict(row) for row in rows]
+        
+        conn.close()
+        
+        return jsonify({
+            'success': True,
+            'count': len(events),
+            'events': events
+        }), 200
+        
+    except Exception as e:
+        logging.error(f"Error fetching events: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+@app.route('/api/stats', methods=['GET'])
+@require_auth
+def get_stats():
+    """Endpoint do pobierania statystyk"""
+    
+    try:
+        conn = sqlite3.connect(DATABASE_PATH)
+        cursor = conn.cursor()
+        
+        # Podstawowe statystyki
+        cursor.execute("SELECT COUNT(*) FROM water_events")
+        total_events = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(DISTINCT device_id) FROM water_events")
+        unique_devices = cursor.fetchone()[0]
+        
+        cursor.execute("""
+            SELECT event_type, COUNT(*) as count 
+            FROM water_events 
+            GROUP BY event_type
+        """)
+        event_types = dict(cursor.fetchall())
+        
+        cursor.execute("""
+            SELECT SUM(volume_ml) as total_volume 
+            FROM water_events
+        """)
+        total_volume = cursor.fetchone()[0] or 0
+        
+        cursor.execute("""
+            SELECT timestamp, volume_ml 
+            FROM water_events 
+            ORDER BY received_at DESC 
+            LIMIT 1
+        """)
+        last_event = cursor.fetchone()
+        
+        conn.close()
+        
+        stats = {
+            'total_events': total_events,
+            'unique_devices': unique_devices,
+            'event_types': event_types,
+            'total_volume_ml': total_volume,
+            'last_event': {
+                'timestamp': last_event[0] if last_event else None,
+                'volume_ml': last_event[1] if last_event else None
+            } if last_event else None
+        }
+        
+        return jsonify({
+            'success': True,
+            'stats': stats
+        }), 200
+        
+    except Exception as e:
+        logging.error(f"Error fetching stats: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+# ===============================
+# ADMIN PANEL ENDPOINTS (NOWE)
+# ===============================
+
+@app.route('/admin')
+@require_admin_auth
+def admin_dashboard():
+    """Admin panel dashboard"""
+    logging.info(f"Admin panel accessed from {request.remote_addr}")
+    return render_template('admin.html')
+
+@app.route('/api/admin-query', methods=['POST'])
+@require_admin_auth
+def admin_execute_query():
+    """Wykonaj zapytanie SQL z admin panel"""
+    
+    try:
+        data = request.get_json()
+        
+        if not data or 'query' not in data:
+            return jsonify({'error': 'No query provided'}), 400
+        
+        query = data['query'].strip()
+        
+        if not query:
+            return jsonify({'error': 'Empty query'}), 400
+        
+        # Walidacja SQL
+        is_valid, error_msg = validate_sql_query(query)
+        if not is_valid:
+            logging.warning(f"Invalid SQL query from {request.remote_addr}: {error_msg}")
+            return jsonify({'error': error_msg}), 400
+        
+        # Wykonaj zapytanie
+        success, result = execute_safe_query(query)
+        
+        if not success:
+            logging.error(f"SQL query error from {request.remote_addr}: {result}")
+            return jsonify({'error': f'Query error: {result}'}), 400
+        
+        logging.info(f"Admin query executed from {request.remote_addr}: {len(result)} rows returned")
+        
+        return jsonify({
+            'success': True,
+            'data': result,
+            'count': len(result),
+            'limited': len(result) >= 1000
+        }), 200
+        
+    except Exception as e:
+        logging.error(f"Admin query exception: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+@app.route('/api/admin-quick-query/<query_type>')
+@require_admin_auth
+def admin_quick_query(query_type):
+    """Wykonaj predefiniowane zapytanie"""
+    
+    quick_queries = {
+        'last24h': """
+            SELECT id, timestamp, event_type, volume_ml, water_status, client_ip 
+            FROM water_events 
+            WHERE received_at > datetime('now', '-24 hours') 
+            ORDER BY received_at DESC
+        """,
+        'today_stats': """
+            SELECT event_type, COUNT(*) as count, SUM(volume_ml) as total_ml 
+            FROM water_events 
+            WHERE DATE(received_at) = DATE('now') 
+            GROUP BY event_type
+        """,
+        'all_events': """
+            SELECT id, timestamp, event_type, volume_ml, water_status 
+            FROM water_events 
+            ORDER BY received_at DESC 
+            LIMIT 100
+        """,
+        'errors': """
+            SELECT id, timestamp, event_type, water_status, system_status, client_ip 
+            FROM water_events 
+            WHERE water_status != 'OK' OR system_status != 'OK' 
+            ORDER BY received_at DESC
+        """,
+        'monthly': """
+            SELECT DATE(received_at) as date, COUNT(*) as events, SUM(volume_ml) as total_ml 
+            FROM water_events 
+            WHERE received_at > datetime('now', '-30 days') 
+            GROUP BY DATE(received_at) 
+            ORDER BY date DESC
+        """
+    }
+    
+    if query_type not in quick_queries:
+        return jsonify({'error': 'Unknown quick query type'}), 400
+    
+    query = quick_queries[query_type]
+    success, result = execute_safe_query(query)
+    
+    if not success:
+        return jsonify({'error': f'Query error: {result}'}), 400
+    
+    return jsonify({
+        'success': True,
+        'data': result,
+        'count': len(result),
+        'query_type': query_type
+    }), 200
+
+@app.route('/api/admin-export/<format>')
+@require_admin_auth
+def admin_export_data(format):
+    """Eksport danych w różnych formatach"""
+    
+    query = request.args.get('query', 'SELECT * FROM water_events ORDER BY received_at DESC LIMIT 1000')
+    
+    # Walidacja SQL
+    is_valid, error_msg = validate_sql_query(query)
+    if not is_valid:
+        return jsonify({'error': error_msg}), 400
+    
+    success, result = execute_safe_query(query)
+    if not success:
+        return jsonify({'error': f'Query error: {result}'}), 400
+    
+    if format == 'csv':
+        # Export CSV
+        output = io.StringIO()
+        if result:
+            writer = csv.DictWriter(output, fieldnames=result[0].keys())
+            writer.writeheader()
+            writer.writerows(result)
+        
+        response = Response(
+            output.getvalue(),
+            mimetype='text/csv',
+            headers={'Content-Disposition': f'attachment; filename=water_events_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'}
+        )
+        return response
+    
+    elif format == 'json':
+        # Export JSON
+        response = Response(
+            json.dumps(result, indent=2),
+            mimetype='application/json',
+            headers={'Content-Disposition': f'attachment; filename=water_events_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json'}
+        )
+        return response
+    
+    else:
+        return jsonify({'error': 'Unsupported format. Use csv or json'}), 400
+
+# ===============================
+# POZOSTAŁE ENDPOINTS (bez zmian)
+# ===============================
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Endpoint sprawdzania stanu aplikacji"""
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': datetime.now().isoformat(),
+        'database': 'connected' if os.path.exists(DATABASE_PATH) else 'missing',
+        'admin_panel': 'available'
+    }), 200
+
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({'error': 'Endpoint not found'}), 404
+
+@app.errorhandler(405)
+def method_not_allowed(error):
+    return jsonify({'error': 'Method not allowed'}), 405
+
+if __name__ == '__main__':
+    # Inicjalizuj bazę danych przy starcie
+    init_database()
+    
+    logging.info("ESP32-C3 Water System VPS Logger started")
+    logging.info(f"Database: {DATABASE_PATH}")
+    logging.info(f"Log file: {LOG_PATH}")
+    logging.info("Admin panel available at: /admin")
+    
+    # Uruchom aplikację
+    app.run(host='0.0.0.0', port=5000, debug=False)
