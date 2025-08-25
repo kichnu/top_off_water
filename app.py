@@ -28,7 +28,9 @@ LOG_PATH = '/home/kichnu/top_off_water/app.log'
 
 #VALID_TOKEN = 'WaterSystem2024_StaticToken_ESP32C3'
 VALID_TOKEN = 'sha256:7b4f8a9c2e6d5a1b8f7e4c9a6d3b2f8e5c1a7b4f9e6d3c8a5b2f7e4c9a6d1b8f'
-VALID_DEVICE_IDS = ['ESP32C3_WaterPump_001']
+# VALID_DEVICE_IDS = ['ESP32C3_WaterPump_001']
+VALID_DEVICE_IDS = ['DOLEWKA']
+
 
 # Konfiguracja portów - NGINX COMPATIBLE
 HTTP_PORT = 5000  # ESP32 API (HTTP only)
@@ -63,37 +65,114 @@ logging.basicConfig(
     ]
 )
 
+
+
 def init_database():
-    """Inicjalizacja bazy danych SQLite"""
+    """Inicjalizacja bazy danych SQLite z rozszerzonymi kolumnami algorytmicznymi"""
     os.makedirs(os.path.dirname(DATABASE_PATH), exist_ok=True)
     
     conn = sqlite3.connect(DATABASE_PATH)
     cursor = conn.cursor()
     
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS water_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            device_id TEXT NOT NULL,
-            timestamp TEXT NOT NULL,
-            unix_time INTEGER NOT NULL,
-            event_type TEXT NOT NULL,
-            volume_ml INTEGER NOT NULL,
-            water_status TEXT NOT NULL,
-            system_status TEXT NOT NULL,
-            received_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            client_ip TEXT
-        )
-    ''')
+    # Sprawdź czy tabela istnieje i ma stare kolumny
+    cursor.execute("PRAGMA table_info(water_events)")
+    existing_columns = [row[1] for row in cursor.fetchall()]
+    
+    if not existing_columns:
+        # Nowa instalacja - utwórz tabelę z wszystkimi kolumnami
+        cursor.execute('''
+            CREATE TABLE water_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                unix_time INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                volume_ml INTEGER NOT NULL,
+                water_status TEXT NOT NULL,
+                system_status TEXT NOT NULL,
+                received_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                client_ip TEXT,
+                
+                -- Rozszerzone kolumny algorytmiczne (v2.0)
+                time_gap_1 INTEGER DEFAULT NULL,
+                time_gap_2 INTEGER DEFAULT NULL,
+                water_trigger_time INTEGER DEFAULT NULL,
+                pump_duration INTEGER DEFAULT NULL,
+                pump_attempts INTEGER DEFAULT NULL,
+                gap1_fail_sum INTEGER DEFAULT NULL,
+                gap2_fail_sum INTEGER DEFAULT NULL,
+                water_fail_sum INTEGER DEFAULT NULL,
+                algorithm_data TEXT DEFAULT NULL
+            )
+        ''')
+        logging.info("Created new water_events table with algorithm columns")
+        
+    else:
+        # Istniejąca tabela - dodaj nowe kolumny jeśli nie istnieją
+        new_columns = [
+            'time_gap_1 INTEGER DEFAULT NULL',
+            'time_gap_2 INTEGER DEFAULT NULL', 
+            'water_trigger_time INTEGER DEFAULT NULL',
+            'pump_duration INTEGER DEFAULT NULL',
+            'pump_attempts INTEGER DEFAULT NULL',
+            'gap1_fail_sum INTEGER DEFAULT NULL',
+            'gap2_fail_sum INTEGER DEFAULT NULL', 
+            'water_fail_sum INTEGER DEFAULT NULL',
+            'last_reset_timestamp INTEGER DEFAULT NULL',
+            'algorithm_data TEXT DEFAULT NULL'
+        ]
+        
+        for column_def in new_columns:
+            column_name = column_def.split()[0]
+            if column_name not in existing_columns:
+                try:
+                    cursor.execute(f'ALTER TABLE water_events ADD COLUMN {column_def}')
+                    logging.info(f"Added column: {column_name}")
+                except sqlite3.Error as e:
+                    logging.warning(f"Could not add column {column_name}: {e}")
     
     # Indeksy dla lepszej wydajności
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_device_id ON water_events(device_id)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON water_events(unix_time)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_event_type ON water_events(event_type)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_algorithm ON water_events(time_gap_1, gap1_fail)')
     
     conn.commit()
     conn.close()
     
-    logging.info("Database initialized successfully")
+    logging.info("Database initialized successfully with algorithm support")
+
+# def init_database():
+#     """Inicjalizacja bazy danych SQLite"""
+#     os.makedirs(os.path.dirname(DATABASE_PATH), exist_ok=True)
+    
+#     conn = sqlite3.connect(DATABASE_PATH)
+#     cursor = conn.cursor()
+    
+#     cursor.execute('''
+#         CREATE TABLE IF NOT EXISTS water_events (
+#             id INTEGER PRIMARY KEY AUTOINCREMENT,
+#             device_id TEXT NOT NULL,
+#             timestamp TEXT NOT NULL,
+#             unix_time INTEGER NOT NULL,
+#             event_type TEXT NOT NULL,
+#             volume_ml INTEGER NOT NULL,
+#             water_status TEXT NOT NULL,
+#             system_status TEXT NOT NULL,
+#             received_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+#             client_ip TEXT
+#         )
+#     ''')
+    
+#     # Indeksy dla lepszej wydajności
+#     cursor.execute('CREATE INDEX IF NOT EXISTS idx_device_id ON water_events(device_id)')
+#     cursor.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON water_events(unix_time)')
+#     cursor.execute('CREATE INDEX IF NOT EXISTS idx_event_type ON water_events(event_type)')
+    
+#     conn.commit()
+#     conn.close()
+    
+#     logging.info("Database initialized successfully")
 
 def cleanup_expired_sessions():
     """Czyści wygasłe sesje i lockout"""
@@ -312,8 +391,9 @@ def execute_safe_query(query, params=None):
     except Exception as e:
         return False, str(e)
 
+
 def validate_event_data(data):
-    """Walidacja danych zdarzenia"""
+    """Walidacja danych zdarzenia z obsługą danych algorytmicznych"""
     required_fields = [
         'device_id', 'timestamp', 'unix_time', 
         'event_type', 'volume_ml', 'water_status', 'system_status'
@@ -324,7 +404,7 @@ def validate_event_data(data):
         if field not in data:
             return False, f"Missing required field: {field}"
     
-    # Sprawdź typy danych
+    # Sprawdź typy danych podstawowych
     try:
         unix_time = int(data['unix_time'])
         volume_ml = int(data['volume_ml'])
@@ -335,17 +415,106 @@ def validate_event_data(data):
     if data['device_id'] not in VALID_DEVICE_IDS:
         return False, f"Invalid device_id: {data['device_id']}"
     
-    # Sprawdź dozwolone typy zdarzeń
-    valid_event_types = ['AUTO_PUMP', 'MANUAL_NORMAL', 'MANUAL_EXTENDED']
+    # Rozszerzona lista typów zdarzeń
+    # valid_event_types = ['AUTO_PUMP', 'MANUAL_NORMAL', 'MANUAL_EXTENDED', 'AUTO_CYCLE_COMPLETE']
+
+    valid_event_types = ['AUTO_PUMP', 'MANUAL_NORMAL', 'MANUAL_EXTENDED', 'AUTO_CYCLE_COMPLETE', 'STATISTICS_RESET']
+
     if data['event_type'] not in valid_event_types:
         return False, f"Invalid event_type: {data['event_type']}"
     
     # Sprawdź dozwolone statusy wody
-    valid_water_statuses = ['OK', 'LOW', 'PARTIAL', 'CHECKING']
+    valid_water_statuses = ['OK', 'LOW', 'PARTIAL', 'CHECKING', 'NORMAL', 'BOTH_LOW', 'SENSOR1_LOW', 'SENSOR2_LOW']
     if data['water_status'] not in valid_water_statuses:
         return False, f"Invalid water_status: {data['water_status']}"
     
+    # Walidacja opcjonalnych pól algorytmicznych (dla AUTO_CYCLE_COMPLETE)
+    # if data['event_type'] == 'AUTO_CYCLE_COMPLETE':
+    #     algorithm_fields = ['time_gap_1', 'time_gap_2', 'water_trigger_time', 
+    #                       'pump_duration', 'pump_attempts', 'gap1_fail', 'gap2_fail', 'water_fail']
+        
+    #     for field in algorithm_fields:
+    #         if field in data:
+    #             try:
+    #                 # Sprawdź czy to liczba
+    #                 int(data[field])
+                    
+    #                 # Sprawdź sensowne zakresy
+    #                 if field in ['gap1_fail', 'gap2_fail', 'water_fail'] and data[field] not in [0, 1]:
+    #                     return False, f"{field} must be 0 or 1"
+                    
+    #                 if field in ['time_gap_1', 'time_gap_2', 'water_trigger_time', 'pump_duration'] and int(data[field]) < 0:
+    #                     return False, f"{field} must be >= 0"
+                        
+    #                 if field == 'pump_attempts' and (int(data[field]) < 1 or int(data[field]) > 10):
+    #                     return False, f"{field} must be between 1-10"
+                        
+    #             except (ValueError, TypeError):
+    #                 return False, f"{field} must be an integer"
+    
+    # return True, "Valid"
+
+    if data['event_type'] == 'AUTO_CYCLE_COMPLETE':
+        algorithm_fields = ['time_gap_1', 'time_gap_2', 'water_trigger_time', 
+                          'pump_duration', 'pump_attempts', 'gap1_fail_sum', 'gap2_fail_sum', 'water_fail_sum']
+        
+        for field in algorithm_fields:
+            if field in data:
+                try:
+                    # Sprawdź czy to liczba
+                    field_value = int(data[field])
+                    
+                    # Sprawdź sensowne zakresy
+                    if field in ['gap1_fail_sum', 'gap2_fail_sum', 'water_fail_sum']:
+                        if field_value < 0 or field_value > 65535:
+                            return False, f"{field} must be 0-65535"
+                    
+                    if field in ['time_gap_1', 'time_gap_2', 'water_trigger_time', 'pump_duration'] and int(data[field]) < 0:
+                        return False, f"{field} must be >= 0"
+                        
+                    if field == 'pump_attempts' and (int(data[field]) < 1 or int(data[field]) > 10):
+                        return False, f"{field} must be between 1-10"
+                        
+                except (ValueError, TypeError):
+                    return False, f"{field} must be an integer"
+    
     return True, "Valid"
+
+
+# def validate_event_data(data):
+#     """Walidacja danych zdarzenia"""
+#     required_fields = [
+#         'device_id', 'timestamp', 'unix_time', 
+#         'event_type', 'volume_ml', 'water_status', 'system_status'
+#     ]
+    
+#     # Sprawdź czy wszystkie wymagane pola są obecne
+#     for field in required_fields:
+#         if field not in data:
+#             return False, f"Missing required field: {field}"
+    
+#     # Sprawdź typy danych
+#     try:
+#         unix_time = int(data['unix_time'])
+#         volume_ml = int(data['volume_ml'])
+#     except (ValueError, TypeError):
+#         return False, "unix_time and volume_ml must be integers"
+    
+#     # Sprawdź czy device_id jest dozwolony
+#     if data['device_id'] not in VALID_DEVICE_IDS:
+#         return False, f"Invalid device_id: {data['device_id']}"
+    
+#     # Sprawdź dozwolone typy zdarzeń
+#     valid_event_types = ['AUTO_PUMP', 'MANUAL_NORMAL', 'MANUAL_EXTENDED']
+#     if data['event_type'] not in valid_event_types:
+#         return False, f"Invalid event_type: {data['event_type']}"
+    
+#     # Sprawdź dozwolone statusy wody
+#     valid_water_statuses = ['OK', 'LOW', 'PARTIAL', 'CHECKING']
+#     if data['water_status'] not in valid_water_statuses:
+#         return False, f"Invalid water_status: {data['water_status']}"
+    
+#     return True, "Valid"
 
 # ===============================
 # ESP32 API ENDPOINTS (HTTP ONLY - PORT 5000)
@@ -353,6 +522,8 @@ def validate_event_data(data):
 
 @app.route('/api/water-events', methods=['POST'])
 @require_auth
+
+
 def receive_water_event():
     """Endpoint do odbierania zdarzeń z ESP32-C3"""
     
@@ -376,16 +547,30 @@ def receive_water_event():
         if not is_valid:
             logging.warning(f"Invalid data from {client_ip}: {error_msg}")
             return jsonify({'error': error_msg}), 400
+
+
         
-        # Zapisz do bazy danych
+        # Zapisz do bazy danych z obsługą danych algorytmicznych
         conn = sqlite3.connect(DATABASE_PATH)
         cursor = conn.cursor()
+        
+        # Przygotuj dane algorytmiczne (opcjonalne)
+        # Przygotuj dane algorytmiczne (opcjonalne)
+        algorithm_values = {}
+        algorithm_fields = ['time_gap_1', 'time_gap_2', 'water_trigger_time', 
+                          'pump_duration', 'pump_attempts', 'gap1_fail_sum', 'gap2_fail_sum', 'water_fail_sum', 
+                          'last_reset_timestamp', 'algorithm_data']
+        
+        for field in algorithm_fields:
+            algorithm_values[field] = data.get(field, None)
         
         cursor.execute('''
             INSERT INTO water_events 
             (device_id, timestamp, unix_time, event_type, volume_ml, 
-             water_status, system_status, client_ip)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             water_status, system_status, client_ip,
+             time_gap_1, time_gap_2, water_trigger_time, pump_duration, pump_attempts,
+             gap1_fail_sum, gap2_fail_sum, water_fail_sum, last_reset_timestamp, algorithm_data)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             data['device_id'],
             data['timestamp'],
@@ -394,8 +579,73 @@ def receive_water_event():
             data['volume_ml'],
             data['water_status'],
             data['system_status'],
-            client_ip
+            client_ip,
+            algorithm_values['time_gap_1'],
+            algorithm_values['time_gap_2'],
+            algorithm_values['water_trigger_time'],
+            algorithm_values['pump_duration'],
+            algorithm_values['pump_attempts'],
+            algorithm_values['gap1_fail_sum'],
+            algorithm_values['gap2_fail_sum'],
+            algorithm_values['water_fail_sum'],
+            algorithm_values['last_reset_timestamp'],
+            algorithm_values['algorithm_data']
         ))
+
+
+        # algorithm_values = {}
+        # algorithm_fields = ['time_gap_1', 'time_gap_2', 'water_trigger_time', 
+        #                   'pump_duration', 'pump_attempts', 'gap1_fail', 'gap2_fail', 'water_fail', 'algorithm_data']
+        
+        # for field in algorithm_fields:
+        #     algorithm_values[field] = data.get(field, None)
+        
+        # cursor.execute('''
+        #     INSERT INTO water_events 
+        #     (device_id, timestamp, unix_time, event_type, volume_ml, 
+        #      water_status, system_status, client_ip,
+        #      time_gap_1, time_gap_2, water_trigger_time, pump_duration, pump_attempts,
+        #      gap1_fail, gap2_fail, water_fail, algorithm_data)
+        #     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        # ''', (
+        #     data['device_id'],
+        #     data['timestamp'],
+        #     data['unix_time'],
+        #     data['event_type'],
+        #     data['volume_ml'],
+        #     data['water_status'],
+        #     data['system_status'],
+        #     client_ip,
+        #     algorithm_values['time_gap_1'],
+        #     algorithm_values['time_gap_2'],
+        #     algorithm_values['water_trigger_time'],
+        #     algorithm_values['pump_duration'],
+        #     algorithm_values['pump_attempts'],
+        #     algorithm_values['gap1_fail'],
+        #     algorithm_values['gap2_fail'],
+        #     algorithm_values['water_fail'],
+        #     algorithm_values['algorithm_data']
+        # ))
+
+        # Zapisz do bazy danych
+        # conn = sqlite3.connect(DATABASE_PATH)
+        # cursor = conn.cursor()
+        
+        # cursor.execute('''
+        #     INSERT INTO water_events 
+        #     (device_id, timestamp, unix_time, event_type, volume_ml, 
+        #      water_status, system_status, client_ip)
+        #     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        # ''', (
+        #     data['device_id'],
+        #     data['timestamp'],
+        #     data['unix_time'],
+        #     data['event_type'],
+        #     data['volume_ml'],
+        #     data['water_status'],
+        #     data['system_status'],
+        #     client_ip
+        # ))
         
         event_id = cursor.lastrowid
         conn.commit()
@@ -425,6 +675,8 @@ def receive_water_event():
     except Exception as e:
         logging.error(f"Unexpected error: {e}")
         return jsonify({'error': 'Internal server error'}), 500
+
+
 
 @app.route('/api/events', methods=['GET'])
 @require_auth
@@ -658,6 +910,7 @@ def admin_execute_query():
 
 @app.route('/api/admin-quick-query/<query_type>')
 @require_admin_auth
+
 def admin_quick_query(query_type):
     """Wykonaj predefiniowane zapytanie"""
     
@@ -668,6 +921,81 @@ def admin_quick_query(query_type):
             WHERE received_at > datetime('now', '-24 hours') 
             ORDER BY received_at DESC
         """,
+        
+        'algorithm_cycles': """
+            SELECT id, timestamp, time_gap_1, time_gap_2, water_trigger_time, 
+                   pump_duration, pump_attempts, gap1_fail_sum, gap2_fail_sum, water_fail_sum,
+                   last_reset_timestamp
+            FROM water_events 
+            WHERE event_type = 'AUTO_CYCLE_COMPLETE' 
+            ORDER BY received_at DESC LIMIT 50
+        """,
+        'algorithm_stats': """
+            SELECT 
+                COUNT(*) as total_cycles,
+                AVG(time_gap_1) as avg_gap1,
+                AVG(time_gap_2) as avg_gap2,
+                AVG(water_trigger_time) as avg_water_time,
+                AVG(pump_duration) as avg_pump_duration,
+                MAX(gap1_fail_sum) as max_gap1_sum,
+                MAX(gap2_fail_sum) as max_gap2_sum,
+                MAX(water_fail_sum) as max_water_sum,
+                AVG(pump_attempts) as avg_attempts
+            FROM water_events 
+            WHERE event_type = 'AUTO_CYCLE_COMPLETE' 
+                AND received_at > datetime('now', '-7 days')
+        """,
+        'algorithm_failures': """
+            SELECT id, timestamp, time_gap_1, time_gap_2, water_trigger_time,
+                   gap1_fail_sum, gap2_fail_sum, water_fail_sum, pump_attempts, algorithm_data,
+                   last_reset_timestamp
+            FROM water_events 
+            WHERE event_type = 'AUTO_CYCLE_COMPLETE' 
+                AND (gap1_fail_sum > 0 OR gap2_fail_sum > 0 OR water_fail_sum > 0 OR pump_attempts > 1)
+            ORDER BY received_at DESC
+        """,
+        'statistics_resets': """
+            SELECT id, timestamp, received_at, client_ip
+            FROM water_events 
+            WHERE event_type = 'STATISTICS_RESET' 
+            ORDER BY received_at DESC LIMIT 20
+        """,
+
+
+
+
+        # 'algorithm_cycles': """
+        #     SELECT id, timestamp, time_gap_1, time_gap_2, water_trigger_time, 
+        #            pump_duration, pump_attempts, gap1_fail, gap2_fail, water_fail
+        #     FROM water_events 
+        #     WHERE event_type = 'AUTO_CYCLE_COMPLETE' 
+        #     ORDER BY received_at DESC LIMIT 50
+        # """,
+        # 'algorithm_stats': """
+        #     SELECT 
+        #         COUNT(*) as total_cycles,
+        #         AVG(time_gap_1) as avg_gap1,
+        #         AVG(time_gap_2) as avg_gap2,
+        #         AVG(water_trigger_time) as avg_water_time,
+        #         AVG(pump_duration) as avg_pump_duration,
+        #         SUM(gap1_fail) as gap1_failures,
+        #         SUM(gap2_fail) as gap2_failures,
+        #         SUM(water_fail) as water_failures,
+        #         AVG(pump_attempts) as avg_attempts
+        #     FROM water_events 
+        #     WHERE event_type = 'AUTO_CYCLE_COMPLETE' 
+        #         AND received_at > datetime('now', '-7 days')
+        # """,
+        # 'algorithm_failures': """
+        #     SELECT id, timestamp, time_gap_1, time_gap_2, water_trigger_time,
+        #            gap1_fail, gap2_fail, water_fail, pump_attempts, algorithm_data
+        #     FROM water_events 
+        #     WHERE event_type = 'AUTO_CYCLE_COMPLETE' 
+        #         AND (gap1_fail = 1 OR gap2_fail = 1 OR water_fail = 1 OR pump_attempts > 1)
+        #     ORDER BY received_at DESC
+        # """,
+
+
         'today_stats': """
             SELECT event_type, COUNT(*) as count, SUM(volume_ml) as total_ml 
             FROM water_events 
